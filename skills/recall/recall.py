@@ -9,12 +9,14 @@ Modes:
   overview — Sample beginning + middle + end of a session (token-efficient arc)
   full     — Full conversation, text only (no tools/thinking/system)
   search   — Keyword search across sessions
+  cache    — Manage cached overviews
 
 Usage:
   python3 recall.py list [--engine ENGINE] [--project PATTERN] [--limit N]
   python3 recall.py overview <session_id> [--engine ENGINE] [--project PATTERN]
   python3 recall.py full <session_id> [--engine ENGINE] [--project PATTERN] [--limit N]
   python3 recall.py search <query> [--engine ENGINE] [--project PATTERN] [--limit N]
+  python3 recall.py cache {stats,clear}
 """
 
 import json, os, sys, glob, argparse, re, sqlite3, time
@@ -49,7 +51,21 @@ CODEX_META_PREFIXES = (
 
 ENGINE_LABELS = {"claude": "CC", "codex": "CX", "gemini": "GM", "opencode": "OC"}
 
-CACHE_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+
+def _get_default_cache_root() -> str:
+    xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return os.path.expanduser(xdg_cache_home)
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Caches")
+    return os.path.expanduser("~/.cache")
+
+
+def get_cache_db_path() -> str:
+    override = os.environ.get("AGENTINIT_RECALL_CACHE_DB")
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(_get_default_cache_root(), "agentinit", "recall", "cache.db")
 
 
 # ─── SessionFile ─────────────────────────────────────────────────────────────
@@ -176,7 +192,8 @@ def _get_gemini_sessions(project_pattern: str | None = None) -> list[SessionFile
                 with open(filepath, "r") as f:
                     data = json.load(f)
                 sid = data.get("sessionId", fname[8:-5])  # strip session- and .json
-                proj_label = f"gemini/{dname[:12]}"
+                project_hash = data.get("projectHash", dname)
+                proj_label = f"gemini/{project_hash[:12]}"
             except (json.JSONDecodeError, IOError):
                 continue
             if project_pattern and project_pattern.lower() not in proj_label.lower():
@@ -191,22 +208,28 @@ def _get_opencode_sessions(project_pattern: str | None = None) -> list[SessionFi
     try:
         conn = sqlite3.connect(f"file:{OPENCODE_DB}?mode=ro", uri=True)
         rows = conn.execute(
-            "SELECT s.id, s.title, s.directory, s.time_created, p.worktree "
-            "FROM session s JOIN project p ON p.id = s.project_id "
-            "WHERE s.time_archived IS NULL ORDER BY s.time_created DESC"
+            "SELECT s.id, s.title, s.directory, s.time_created, "
+            "COALESCE(MAX(m.time_created), s.time_created) AS last_activity, p.worktree "
+            "FROM session s "
+            "JOIN project p ON p.id = s.project_id "
+            "LEFT JOIN message m ON m.session_id = s.id "
+            "WHERE s.time_archived IS NULL "
+            "GROUP BY s.id, s.title, s.directory, s.time_created, p.worktree "
+            "ORDER BY last_activity DESC"
         ).fetchall()
         conn.close()
     except (sqlite3.Error, IOError):
         return []
 
     sessions = []
-    for sid, title, directory, time_created, worktree in rows:
+    for sid, title, directory, time_created, last_activity, worktree in rows:
         cwd = worktree or directory or ""
         project = _project_from_cwd(cwd) if cwd else (title or sid[:12])
         if project_pattern and project_pattern.lower() not in project.lower() \
                 and (not cwd or project_pattern.lower() not in cwd.lower()):
             continue
-        mtime = time_created / 1000.0 if time_created else 0
+        mtime_ms = last_activity or time_created or 0
+        mtime = mtime_ms / 1000.0
         sessions.append(SessionFile("opencode", sid, project, OPENCODE_DB, mtime, cwd))
     return sessions
 
@@ -472,7 +495,9 @@ def cmd_list(args):
 # ─── Overview cache ──────────────────────────────────────────────────────────
 
 def _get_cache_conn():
-    conn = sqlite3.connect(CACHE_DB)
+    cache_db = get_cache_db_path()
+    Path(cache_db).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(cache_db)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""CREATE TABLE IF NOT EXISTS overview_cache (
         engine      TEXT NOT NULL,
@@ -516,20 +541,22 @@ def _cache_put(engine: str, session_id: str, sample_size: int, mtime: float, ove
 
 
 def _cache_clear():
-    if not os.path.isfile(CACHE_DB):
+    cache_db = get_cache_db_path()
+    if not os.path.isfile(cache_db):
         print("No cache to clear.")
         return
-    os.remove(CACHE_DB)
+    os.remove(cache_db)
     # Also remove WAL/SHM files if present
     for suffix in ("-wal", "-shm"):
-        p = CACHE_DB + suffix
+        p = cache_db + suffix
         if os.path.isfile(p):
             os.remove(p)
     print("Cache cleared.")
 
 
 def _cache_stats():
-    if not os.path.isfile(CACHE_DB):
+    cache_db = get_cache_db_path()
+    if not os.path.isfile(cache_db):
         print("No cache exists yet.")
         return
     try:
@@ -541,7 +568,8 @@ def _cache_stats():
     except (sqlite3.Error, OSError) as e:
         print(f"Error reading cache: {e}")
         return
-    size_kb = os.path.getsize(CACHE_DB) / 1024
+    cache_files = [cache_db, cache_db + "-wal", cache_db + "-shm"]
+    size_kb = sum(os.path.getsize(path) for path in cache_files if os.path.isfile(path)) / 1024
     print(f"Cache entries: {count}")
     print(f"Database size: {size_kb:.1f} KB")
     if oldest:

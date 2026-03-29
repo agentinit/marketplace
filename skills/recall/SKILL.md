@@ -10,7 +10,15 @@ allowed-tools:
 
 # Recall — Search Previous Agent Sessions
 
-Helper script: `~/.claude/skills/recall/recall.py`
+Use the bundled `recall.py` from the installed skill directory.
+
+Common AgentInit install paths:
+- Project install: `.agents/skills/recall/recall.py`
+- Global Claude Code install: `~/.claude/skills/recall/recall.py`
+- Global Codex install: `~/.codex/skills/recall/recall.py`
+- Global Gemini install: `~/.gemini/skills/recall/recall.py`
+
+Examples below use `<recall.py>` as a stand-in for the actual installed path.
 
 Supported engines: **Claude Code** (CC), **Codex** (CX), **Gemini CLI** (GM), **OpenCode** (OC)
 
@@ -19,40 +27,45 @@ Supported engines: **Claude Code** (CC), **Codex** (CX), **Gemini CLI** (GM), **
 ### 1. `list` — Browse recent sessions (cheapest)
 Shows engine, date, project, first user message as title, session ID.
 ```bash
-python3 ~/.claude/skills/recall/recall.py list                         # all engines, last 20
-python3 ~/.claude/skills/recall/recall.py list -e claude               # Claude Code only
-python3 ~/.claude/skills/recall/recall.py list -e codex -p myproject   # Codex, filter by project
-python3 ~/.claude/skills/recall/recall.py list -n 50                   # more results
+python3 <recall.py> list                         # all engines, last 20
+python3 <recall.py> list -e claude               # Claude Code only
+python3 <recall.py> list -e codex -p myproject   # Codex, filter by project
+python3 <recall.py> list -n 50                   # more results
 ```
 
 ### 2. `overview` — Session arc (token-efficient, cached)
 Samples beginning + middle + end of a session to show its direction without reading everything.
-Overviews are **cached in SQLite** (`~/.claude/skills/recall/cache.db`) for instant repeated access. Cache is automatically invalidated when the session file changes (mtime comparison).
+Overviews are **cached in SQLite** in the user cache directory outside the repo worktree.
+- macOS default: `~/Library/Caches/agentinit/recall/cache.db`
+- Linux default: `$XDG_CACHE_HOME/agentinit/recall/cache.db` or `~/.cache/agentinit/recall/cache.db`
+- Override: `AGENTINIT_RECALL_CACHE_DB=/custom/path/cache.db`
+
+Cache is automatically invalidated when the source session changes.
 ```bash
-python3 ~/.claude/skills/recall/recall.py overview <session_id>
-python3 ~/.claude/skills/recall/recall.py overview <session_id> -n 5       # 5 messages per section
-python3 ~/.claude/skills/recall/recall.py overview <session_id> --no-cache # force regeneration
+python3 <recall.py> overview <session_id>
+python3 <recall.py> overview <session_id> -n 5       # 5 messages per section
+python3 <recall.py> overview <session_id> --no-cache # force regeneration
 ```
 
 ### 3. `full` — Complete conversation text (no tool calls/thinking/system)
 Pure user messages and assistant text responses only. Use when you need the actual content.
 ```bash
-python3 ~/.claude/skills/recall/recall.py full <session_id>
-python3 ~/.claude/skills/recall/recall.py full <session_id> -n 30      # first 30 messages only
+python3 <recall.py> full <session_id>
+python3 <recall.py> full <session_id> -n 30      # first 30 messages only
 ```
 
 ### 4. `cache` — Manage overview cache
 ```bash
-python3 ~/.claude/skills/recall/recall.py cache stats   # show entry count / size
-python3 ~/.claude/skills/recall/recall.py cache clear   # delete cache.db (always safe)
+python3 <recall.py> cache stats   # show entry count / size
+python3 <recall.py> cache clear   # delete cache.db (always safe)
 ```
 
 ### 5. `search` — Keyword search across sessions
 All terms must match (AND logic). Sorted by most recent first. Searches across all engines by default.
 ```bash
-python3 ~/.claude/skills/recall/recall.py search "docker traefik"
-python3 ~/.claude/skills/recall/recall.py search "auth" -e claude -p router
-python3 ~/.claude/skills/recall/recall.py search "wireguard" -n 30
+python3 <recall.py> search "docker traefik"
+python3 <recall.py> search "auth" -e claude -p router
+python3 <recall.py> search "wireguard" -n 30
 ```
 
 ## Workflow
@@ -62,16 +75,18 @@ python3 ~/.claude/skills/recall/recall.py search "wireguard" -n 30
 1. **Auto-filter by current project**: When the user does not specify a project, automatically add `-p <current_project_name>` (derived from the working directory basename). Only omit `-p` when the user explicitly asks for "all projects" or "all sessions".
 2. **Auto-escalate to `overview`**: When the user asks for a "summary" of sessions, don't stop at `list`. After listing, run `overview` on each session to provide actual content summaries — not just titles. Batch overview calls in the subagent to keep it efficient.
 
-**IMPORTANT: Always delegate recall work to a subagent** using the Agent tool with `model: "haiku"` (cheap and fast — this is just log reading, no reasoning needed). This keeps session log data out of the main context window and saves tokens/cost.
+Project filtering works best for Claude Code, Codex, and OpenCode because those backends expose a cwd/worktree. Gemini CLI sessions currently expose only a `projectHash`, so `-p` matches that hash label rather than the original project directory.
 
-Example delegation:
+**IMPORTANT: Prefer delegating recall work to a cheap subagent** when the current agent supports delegation. This keeps raw session logs out of the main context window and saves tokens/cost.
+
+Example delegation prompt:
 ```
-Agent(
-  subagent_type="general-purpose",
-  model="haiku",
-  description="Recall past VPN sessions",
-  prompt="Use the recall helper script at ~/.claude/skills/recall/recall.py to find information about VPN tunnel setup. Steps: 1) Run `python3 ~/.claude/skills/recall/recall.py search 'wireguard vpn'` to find relevant sessions. 2) For promising matches, run `python3 ~/.claude/skills/recall/recall.py overview <session_id>` to get context. 3) If you need full details, use the `full` mode. Summarize your findings concisely: what was done, what decisions were made, what the current state is."
-)
+Use the recall helper script at <recall.py> to find information about VPN tunnel setup.
+Steps:
+1. Run `python3 <recall.py> search 'wireguard vpn'` to find relevant sessions.
+2. For promising matches, run `python3 <recall.py> overview <session_id>` to get context.
+3. If you need full details, use the `full` mode.
+Summarize the findings concisely: what was done, what decisions were made, and what the current state is.
 ```
 
 When delegating to a subagent:
@@ -92,6 +107,7 @@ When delegating to a subagent:
 - `-e, --engine ENGINE` — filter by engine: `claude`, `codex`, `gemini`, `opencode` (omit for all)
 - `-p, --project PATTERN` — filter sessions by project directory name (substring match, case-insensitive)
 - `-n, --limit N` — limit results/messages
+- Gemini note: `-p` filters by the Gemini project hash label because Gemini session files do not expose the original cwd
 
 The `--engine` flag can go before or after the mode:
 ```bash

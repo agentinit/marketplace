@@ -28,6 +28,6 @@ user_invocable: true
 ## Installing from this marketplace
 
 ```bash
-agentinit plugins search                        # list all available items
-agentinit plugins install agentinit/<name>       # install a skill/mcp/rule
+agentinit plugins search --from agentinit      # list all available items
+agentinit plugins install agentinit/<name>     # install a skill/mcp/rule
 ```
