@@ -72,7 +72,7 @@ python3 <recall.py> search "wireguard" -n 30
 
 ### Default behaviors
 
-1. **Auto-filter by current project**: When the user does not specify a project, automatically add `-p <current_project_name>` (derived from the working directory basename). Only omit `-p` when the user explicitly asks for "all projects" or "all sessions".
+1. **Choose project scope deliberately**: Do not auto-add `-p <current_project_name>` blindly. Use project filtering only when the user is clearly asking about the current repo or names a project. If the user asks things like "when did we fix X before", "find prior sessions", "search history", or otherwise sounds cross-project, search globally first with `--all-projects` and narrow later only if needed.
 2. **Auto-escalate to `overview`**: When the user asks for a "summary" of sessions, don't stop at `list`. After listing, run `overview` on each session to provide actual content summaries — not just titles. Batch overview calls in the subagent to keep it efficient.
 
 Project filtering works best for Claude Code, Codex, and OpenCode because those backends expose a cwd/worktree. Gemini CLI sessions currently expose only a `projectHash`, so `-p` matches that hash label rather than the original project directory.
@@ -83,9 +83,10 @@ Example delegation prompt:
 ```
 Use the recall helper script at <recall.py> to find information about VPN tunnel setup.
 Steps:
-1. Run `python3 <recall.py> search 'wireguard vpn'` to find relevant sessions.
-2. For promising matches, run `python3 <recall.py> overview <session_id>` to get context.
-3. If you need full details, use the `full` mode.
+1. Run `python3 <recall.py> search 'wireguard vpn' --all-projects` to find relevant sessions.
+2. If the results are too broad, narrow with `-p <project>`.
+3. For promising matches, run `python3 <recall.py> overview <session_id> --all-projects` to get context.
+4. If you need full details, use the `full` mode.
 Summarize the findings concisely: what was done, what decisions were made, and what the current state is.
 ```
 
@@ -98,14 +99,16 @@ When delegating to a subagent:
 ### Mode escalation within the subagent
 
 1. **Start with `search`** to find relevant sessions by keyword
-2. **Use `overview`** on promising session IDs to understand the arc
-3. **Use `full`** only if the subagent needs actual conversation details
-4. **Use `list`** when no keywords are known — browse recent sessions first
+2. **Default to `--all-projects`** for history/problem searches unless the user explicitly scoped the project
+3. **Use `overview`** on promising session IDs to understand the arc
+4. **Use `full`** only if the subagent needs actual conversation details
+5. **Use `list`** when no keywords are known — browse recent sessions first
 
 ## Flags
 
 - `-e, --engine ENGINE` — filter by engine: `claude`, `codex`, `gemini`, `opencode` (omit for all)
 - `-p, --project PATTERN` — filter sessions by project directory name (substring match, case-insensitive)
+- `--all-projects` — ignore project filtering and search/list across every project
 - `-n, --limit N` — limit results/messages
 - Gemini note: `-p` filters by the Gemini project hash label because Gemini session files do not expose the original cwd
 
@@ -136,8 +139,9 @@ Only **user text** and **assistant text responses** are shown.
 
 ## Tips
 
-- **Always use a subagent** — session logs are large; keep them out of main context
+- Prefer a subagent for `full` mode or broad multi-session scans so raw logs stay out of the main context
 - Session IDs support prefix matching — you can use just the first few chars
 - `list` reads only metadata — fast even with thousands of sessions
 - Use `-e` to narrow to a specific engine when you know which agent was used
+- Start broad with `--all-projects` for "find when we fixed/decided X" style questions, then narrow with `-p` only if needed
 - For broad searches across many projects, spawn multiple subagents in parallel (one per engine)

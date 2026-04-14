@@ -12,10 +12,10 @@ Modes:
   cache    — Manage cached overviews
 
 Usage:
-  python3 recall.py list [--engine ENGINE] [--project PATTERN] [--limit N]
-  python3 recall.py overview <session_id> [--engine ENGINE] [--project PATTERN]
-  python3 recall.py full <session_id> [--engine ENGINE] [--project PATTERN] [--limit N]
-  python3 recall.py search <query> [--engine ENGINE] [--project PATTERN] [--limit N]
+  python3 recall.py list [--engine ENGINE] [--project PATTERN] [--all-projects] [--limit N]
+  python3 recall.py overview <session_id> [--engine ENGINE] [--project PATTERN] [--all-projects]
+  python3 recall.py full <session_id> [--engine ENGINE] [--project PATTERN] [--all-projects] [--limit N]
+  python3 recall.py search <query> [--engine ENGINE] [--project PATTERN] [--all-projects] [--limit N]
   python3 recall.py cache {stats,clear}
 """
 
@@ -50,6 +50,16 @@ CODEX_META_PREFIXES = (
 )
 
 ENGINE_LABELS = {"claude": "CC", "codex": "CX", "gemini": "GM", "opencode": "OC"}
+SEARCH_NOISE_PATTERNS = (
+    "use recall skill",
+    "recall helper script",
+    "global recall searches were run",
+    "only one prior session matched",
+    "use the recall helper script",
+    "run broad searches across all projects",
+    "run `python3 <recall.py> search",
+    "steps:\n1. run",
+)
 
 
 def _get_default_cache_root() -> str:
@@ -466,10 +476,80 @@ def find_session(session_id: str, engine: str | None = None, project: str | None
     return None
 
 
+def _resolve_project(args) -> str | None:
+    if getattr(args, "all_projects", False):
+        return None
+    return getattr(args, "project", None)
+
+
+def _normalize_search_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _text_is_noise(text: str) -> bool:
+    normalized = _normalize_search_text(text)
+    return any(pattern in normalized for pattern in SEARCH_NOISE_PATTERNS)
+
+
+def _term_regex(term: str) -> re.Pattern[str]:
+    pieces = [re.escape(part) for part in term.split()]
+    pattern = r"\b" + r"\s+".join(pieces) + r"\b"
+    return re.compile(pattern, re.IGNORECASE)
+
+
+def _term_positions(text: str, query_terms: list[str]) -> list[int]:
+    positions = []
+    for term in query_terms:
+        match = _term_regex(term).search(text)
+        if match:
+            positions.append(match.start())
+    return positions
+
+
+def _make_snippet(text: str, query_terms: list[str], *, max_chars: int = 400) -> str:
+    positions = _term_positions(text, query_terms)
+    if positions:
+        start = max(0, min(positions) - 100)
+        end = min(len(text), start + max_chars)
+        prefix = "..." if start > 0 else ""
+        suffix = "..." if end < len(text) else ""
+        return prefix + text[start:end] + suffix
+    trimmed = text[:max_chars]
+    return trimmed + ("..." if len(text) > max_chars else "")
+
+
+def _score_match(session: SessionFile, title: str, text: str, query: str, query_terms: list[str]) -> tuple[int, bool]:
+    normalized_query = _normalize_search_text(query)
+    text_lower = text.lower()
+    title_lower = title.lower()
+    project_lower = session.project.lower()
+    title_and_text = f"{title}\n{text}"
+
+    exact_query = bool(normalized_query and _term_regex(normalized_query).search(_normalize_search_text(text)))
+    all_terms_in_text = all(_term_regex(term).search(text_lower) for term in query_terms)
+    all_terms_in_title = bool(title_lower) and all(_term_regex(term).search(title_lower) for term in query_terms)
+    if not (all_terms_in_text or all_terms_in_title or exact_query):
+        return 0, False
+
+    score = 0
+    if exact_query:
+        score += 120
+    if all_terms_in_text:
+        score += 80
+    if all_terms_in_title:
+        score += 60
+    score += sum(20 for term in query_terms if _term_regex(term).search(title_lower))
+    score += sum(10 for term in query_terms if _term_regex(term).search(project_lower))
+    score += min(len(query_terms), 6) * 3
+    if not _text_is_noise(title_and_text):
+        score += 15
+    return score, True
+
+
 # ─── MODE: list ──────────────────────────────────────────────────────────────
 
 def cmd_list(args):
-    sessions = get_all_sessions(args.engine, args.project)
+    sessions = get_all_sessions(args.engine, _resolve_project(args))
     limit = args.limit or 20
 
     print(f"{'#':>3}  {'Eng':4}  {'Date':16}  {'Project':30}  Title")
@@ -628,7 +708,7 @@ def _generate_overview(session: SessionFile, sample_size: int) -> str | None:
 
 
 def cmd_overview(args):
-    session = find_session(args.session_id, args.engine, args.project)
+    session = find_session(args.session_id, args.engine, _resolve_project(args))
     if not session:
         print(f"Session not found: {args.session_id}")
         sys.exit(1)
@@ -654,7 +734,7 @@ def cmd_overview(args):
 # ─── MODE: full ──────────────────────────────────────────────────────────────
 
 def cmd_full(args):
-    session = find_session(args.session_id, args.engine, args.project)
+    session = find_session(args.session_id, args.engine, _resolve_project(args))
     if not session:
         print(f"Session not found: {args.session_id}")
         sys.exit(1)
@@ -681,50 +761,56 @@ def cmd_full(args):
 
 def cmd_search(args):
     query_terms = args.query.lower().split()
-    sessions = get_all_sessions(args.engine, args.project)
+    sessions = get_all_sessions(args.engine, _resolve_project(args))
     limit = args.limit or 15
     results = []
 
     for session in sessions:
-        if len(results) >= limit:
-            break
+        title = _get_title(session)
+        best = None
 
         for m in parse_messages(session):
-            if len(results) >= limit:
-                break
-            text_lower = m["text"].lower()
-            if all(t in text_lower for t in query_terms):
-                results.append({
-                    "engine": session.engine,
-                    "project": session.project,
-                    "session": session.session_id,
-                    "type": m["type"],
-                    "timestamp": m["timestamp"],
-                    "text": m["text"],
-                })
+            score, matched = _score_match(session, title, m["text"], args.query, query_terms)
+            if not matched:
+                continue
+            candidate = {
+                "engine": session.engine,
+                "project": session.project,
+                "session": session.session_id,
+                "type": m["type"],
+                "timestamp": m["timestamp"],
+                "text": m["text"],
+                "title": title,
+                "score": score,
+                "mtime": session.mtime,
+                "noise": _text_is_noise(f"{title}\n{m['text']}"),
+            }
+            if best is None or candidate["score"] > best["score"] or (
+                candidate["score"] == best["score"] and candidate["timestamp"] > best["timestamp"]
+            ):
+                best = candidate
+
+        if best is not None:
+            results.append(best)
+
+    results.sort(key=lambda r: (r["noise"], -r["score"], -r["mtime"]))
+    results = results[:limit]
 
     if not results:
         print(f"No matches for: {args.query}")
         return
 
-    print(f"Found {len(results)} matches for: {args.query}\n")
+    print(f"Found {len(results)} session matches for: {args.query}\n")
 
     for i, r in enumerate(results, 1):
         role = "USER" if r["type"] == "user" else "ASSISTANT"
         eng = ENGINE_LABELS.get(r["engine"], "??")
         print(f"[{i}] {role} | [{eng}] {format_ts(r['timestamp'])} | {r['project']}")
         print(f"    sid:{r['session']}")
-
-        text = r["text"]
-        tl = text.lower()
-        pos = min((p for t in query_terms if (p := tl.find(t)) >= 0), default=-1)
-        if pos >= 0:
-            start = max(0, pos - 100)
-            end = min(len(text), pos + 300)
-            snippet = ("..." if start > 0 else "") + text[start:end] + ("..." if end < len(text) else "")
-            print(f"    {snippet}\n")
-        else:
-            print(f"    {text[:400]}\n")
+        if r["title"]:
+            print(f"    title:{r['title']}")
+        print(f"    score:{r['score']}")
+        print(f"    {_make_snippet(r['text'], query_terms)}\n")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -736,12 +822,14 @@ def main():
 
     p_list = sub.add_parser("list", help="List recent sessions")
     p_list.add_argument("--project", "-p", help="Filter by project name pattern")
+    p_list.add_argument("--all-projects", action="store_true", help="Search/list across all projects")
     p_list.add_argument("--limit", "-n", type=int, help="Max sessions (default: 20)")
     p_list.add_argument("--engine", "-e", choices=ENGINES, dest="sub_engine", help="Filter by engine")
 
     p_over = sub.add_parser("overview", help="Session arc: beginning + middle + end")
     p_over.add_argument("session_id", help="Session UUID (or prefix)")
     p_over.add_argument("--project", "-p", help="Filter by project name pattern")
+    p_over.add_argument("--all-projects", action="store_true", help="Search/list across all projects")
     p_over.add_argument("--limit", "-n", type=int, help="Messages per section (default: 3)")
     p_over.add_argument("--engine", "-e", choices=ENGINES, dest="sub_engine", help="Filter by engine")
     p_over.add_argument("--no-cache", action="store_true", help="Skip cache, regenerate overview")
@@ -749,12 +837,14 @@ def main():
     p_full = sub.add_parser("full", help="Full conversation, text only")
     p_full.add_argument("session_id", help="Session UUID (or prefix)")
     p_full.add_argument("--project", "-p", help="Filter by project name pattern")
+    p_full.add_argument("--all-projects", action="store_true", help="Search/list across all projects")
     p_full.add_argument("--limit", "-n", type=int, help="Max messages to show")
     p_full.add_argument("--engine", "-e", choices=ENGINES, dest="sub_engine", help="Filter by engine")
 
     p_search = sub.add_parser("search", help="Keyword search across sessions")
     p_search.add_argument("query", help="Search query (space-separated terms, all must match)")
     p_search.add_argument("--project", "-p", help="Filter by project name pattern")
+    p_search.add_argument("--all-projects", action="store_true", help="Search/list across all projects")
     p_search.add_argument("--limit", "-n", type=int, help="Max results (default: 15)")
     p_search.add_argument("--engine", "-e", choices=ENGINES, dest="sub_engine", help="Filter by engine")
 
