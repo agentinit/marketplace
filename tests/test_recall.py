@@ -1,9 +1,12 @@
 import importlib.util
 import os
 import sqlite3
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -108,6 +111,106 @@ class OpenCodeSessionTests(unittest.TestCase):
             self.assertEqual([session.session_id for session in sessions], ["session-a", "session-b"])
             self.assertEqual(sessions[0].mtime, 5.0)
             self.assertEqual(sessions[0].project, "workspace/project-a")
+
+
+class SearchBehaviorTests(unittest.TestCase):
+    def test_all_projects_ignores_project_filter(self):
+        args = SimpleNamespace(project="aconnect", all_projects=True)
+        self.assertIsNone(recall._resolve_project(args))
+
+    def test_search_title_only_match_does_not_show_unrelated_message_body(self):
+        session = recall.SessionFile("claude", "title-session", "net/vpn", "/tmp/title.jsonl", 10.0)
+        messages = [
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-14T09:00:00+00:00",
+                "text": "still unrelated",
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-04-14T09:01:00+00:00",
+                "text": "also unrelated",
+            },
+        ]
+
+        args = SimpleNamespace(
+            query="wireguard vpn",
+            engine=None,
+            project=None,
+            all_projects=True,
+            limit=10,
+        )
+
+        with patch.object(recall, "get_all_sessions", return_value=[session]), \
+             patch.object(recall, "parse_messages", return_value=messages), \
+             patch.object(recall, "_get_title", return_value="Wireguard VPN setup issue"), \
+             patch.object(recall, "_get_timestamp", return_value="2026-04-14T08:59:00+00:00"):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                recall.cmd_search(args)
+
+        output = buf.getvalue()
+        self.assertIn("[1] SESSION | [CC] 2026-04-14 08:59 | net/vpn", output)
+        self.assertIn("title:Wireguard VPN setup issue", output)
+        self.assertIn("matched on session title", output)
+        self.assertNotIn("still unrelated", output)
+        self.assertNotIn("also unrelated", output)
+
+    def test_search_returns_one_best_match_per_session_and_downranks_noise(self):
+        noisy = recall.SessionFile("codex", "noise-session", "git/aconnect", "/tmp/noise.jsonl", 20.0)
+        relevant = recall.SessionFile("claude", "real-session", "sh/trino", "/tmp/real.jsonl", 10.0)
+
+        messages = {
+            noisy.session_id: [
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-04-14T09:00:00+00:00",
+                    "text": "Use the recall helper script to find split sessions and summarize them.",
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-04-14T09:01:00+00:00",
+                    "text": "Global recall searches were run for split and related terms.",
+                },
+            ],
+            relevant.session_id: [
+                {
+                    "type": "user",
+                    "timestamp": "2026-04-09T06:04:00+00:00",
+                    "text": "TrinoExternalError name=ICEBERG_CANNOT_OPEN_SPLIT while reading the partition.",
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-04-09T06:05:00+00:00",
+                    "text": "The split failure comes from corrupted parquet files in the Iceberg partition.",
+                },
+            ],
+        }
+        titles = {
+            noisy.session_id: "use recall skill to get the sessions when we've been fixing split errors",
+            relevant.session_id: "analyze the script please.",
+        }
+
+        args = SimpleNamespace(
+            query="split",
+            engine=None,
+            project="aconnect",
+            all_projects=True,
+            limit=10,
+        )
+
+        with patch.object(recall, "get_all_sessions", return_value=[noisy, relevant]), \
+             patch.object(recall, "parse_messages", side_effect=lambda session: messages[session.session_id]), \
+             patch.object(recall, "_get_title", side_effect=lambda session: titles[session.session_id]):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                recall.cmd_search(args)
+
+        output = buf.getvalue()
+        self.assertIn("Found 2 session matches for: split", output)
+        self.assertEqual(output.count("sid:noise-session"), 1)
+        self.assertEqual(output.count("sid:real-session"), 1)
+        self.assertLess(output.index("sid:real-session"), output.index("sid:noise-session"))
 
 
 if __name__ == "__main__":
